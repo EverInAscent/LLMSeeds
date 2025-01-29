@@ -2,7 +2,7 @@
 
 LLM Seeds are PDFs that are interactions with LLMs that can be passed between people for advanced communication methods. 
 
-This code is a method for Creating Transcripts from Podcasts in an RSS feed. 
+This code is a method for creating transcripts from podcasts by entering the RSS feed. 
 In this case, having transcripts from multiple podcasts that can be integrated into a LLM for comparison and analysis is the basic idea. 
 
 Basic Code to Download Audio from RSS Feed (Podcast) and Transcribe for LLM Usage
