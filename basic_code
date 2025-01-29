@@ -1,0 +1,266 @@
+import os
+import re
+import shutil
+import requests
+import feedparser
+from dotenv import load_dotenv
+from pydub import AudioSegment
+from pydub.utils import make_chunks
+
+# Load your .env file so we have access to OPENAI_API_KEY
+load_dotenv("key2.env")
+
+###########################################################################
+# Cost-Estimation Constants
+COST_PER_MINUTE = 0.006  # Whisper API cost (USD) per minute (as of Jan 2023)
+###########################################################################
+
+def sanitize_filename(name: str) -> str:
+    """
+    Replace characters that are not valid in filenames with an underscore.
+    """
+    return re.sub(r'[\\/:*?"<>|]', '_', name)
+
+def parse_itunes_duration(duration_str: str) -> int:
+    """
+    Attempts to parse an iTunes duration string into total seconds.
+    Examples of possible formats:
+      "185"           -> 185 seconds
+      "01:05"         -> 65 seconds   (MM:SS)
+      "01:02:30"      -> 3750 seconds (HH:MM:SS)
+    Returns total seconds, or 0 if parsing fails.
+    """
+    if not duration_str:
+        return 0
+
+    # Sometimes it might just be an integer number of seconds:
+    if duration_str.isdigit():
+        return int(duration_str)
+
+    # Alternatively, it might be HH:MM:SS or MM:SS
+    parts = duration_str.split(":")
+    parts = [p.strip() for p in parts]
+
+    try:
+        if len(parts) == 3:
+            # HH:MM:SS
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = int(parts[2])
+            return hours * 3600 + minutes * 60 + seconds
+        elif len(parts) == 2:
+            # MM:SS
+            minutes = int(parts[0])
+            seconds = int(parts[1])
+            return minutes * 60 + seconds
+        else:
+            # If it's an unexpected format, just return 0
+            return 0
+    except ValueError:
+        return 0
+
+def estimate_cost_for_episodes(feed, entries_to_process):
+    """
+    Estimate total cost for the given episodes by summing
+    their durations (from itunes_duration) and multiplying
+    by COST_PER_MINUTE.
+    """
+    total_seconds = 0
+
+    for idx, entry in enumerate(entries_to_process, start=1):
+        # Some feeds store duration in entry.itunes_duration
+        # (the feedparser library often exposes it as 'itunes_duration')
+        duration_str = getattr(entry, 'itunes_duration', None)
+        if duration_str:
+            seconds = parse_itunes_duration(duration_str)
+            total_seconds += seconds
+        else:
+            # No duration found
+            print(f"Warning: No itunes_duration found for episode {idx} ('{entry.title}'). "
+                  "Estimate may be incomplete.")
+
+    total_minutes = total_seconds / 60
+    estimated_cost = total_minutes * COST_PER_MINUTE
+    return estimated_cost
+
+def split_audio_into_chunks(file_path: str, chunk_size_ms=300_000) -> list:
+    """
+    Splits an audio file into smaller chunks (default: 5 minutes per chunk).
+    Returns a list of file paths to the generated chunk files.
+    """
+    audio = AudioSegment.from_file(file_path)
+    audio_chunks = make_chunks(audio, chunk_size_ms)
+
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    output_dir = os.path.join(os.path.dirname(file_path), base_name + "_chunks")
+    os.makedirs(output_dir, exist_ok=True)
+
+    chunk_files = []
+    for i, chunk in enumerate(audio_chunks, start=1):
+        chunk_name = f"{base_name}_part{i}.mp3"
+        chunk_path = os.path.join(output_dir, chunk_name)
+        chunk.export(chunk_path, format="mp3")
+        chunk_files.append(chunk_path)
+
+    return chunk_files
+
+def transcribe_audio(file_path: str) -> str:
+    """
+    Sends a single audio file (chunk) to the OpenAI Whisper API
+    and returns the transcription text.
+    """
+    url = "https://api.openai.com/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+
+    with open(file_path, "rb") as audio_file:
+        files = {
+            "file": (os.path.basename(file_path), audio_file, "application/octet-stream"),
+            "model": (None, "whisper-1"),
+        }
+        response = requests.post(url, headers=headers, files=files)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("text", "")
+        else:
+            raise Exception(
+                f"Request failed with status {response.status_code}. "
+                f"Details: {response.text}"
+            )
+
+def main():
+    """
+    1. Prompt user for RSS feed URL and how many episodes they want.
+    2. Estimate cost for transcribing those episodes (using itunes_duration).
+    3. Parse feed, create subfolder for the podcast.
+    4. For each episode:
+       - Download it to 'chunks' folder (locally).
+       - Split into smaller .mp3 chunks.
+       - Transcribe each chunk.
+       - Save .txt files to 'transcriptions/<PodcastTitle>/'.
+       - Delete the chunked .mp3 files once finished.
+    """
+    # Prompt for feed URL
+    feed_url = input("Enter RSS feed URL: ").strip()
+    if not feed_url:
+        print("No RSS feed URL provided; exiting.")
+        return
+
+    # Prompt for how many episodes to process
+    num_episodes_str = input("How many episodes do you want to process? (Leave blank to process all) ").strip()
+    try:
+        num_episodes = int(num_episodes_str) if num_episodes_str else None
+    except ValueError:
+        print("Invalid number entered; processing all episodes instead.")
+        num_episodes = None
+
+    # Parse the RSS feed
+    print("Parsing RSS feed...")
+    feed = feedparser.parse(feed_url)
+    if not feed.entries:
+        print("No episodes found in this RSS feed.")
+        return
+
+    # Filter the episodes to process
+    entries_to_process = feed.entries
+    if num_episodes is not None:
+        entries_to_process = feed.entries[:num_episodes]
+
+    # --- ESTIMATE COST FIRST ---
+    estimated_cost = estimate_cost_for_episodes(feed, entries_to_process)
+    if estimated_cost > 0:
+        print(f"\nEstimated cost for transcribing {len(entries_to_process)} episodes: "
+              f"${estimated_cost:.2f} (at ${COST_PER_MINUTE}/minute).")
+    else:
+        print("\nWarning: Could not estimate cost because no durations were found in the feed.")
+    # Ask user if they want to proceed
+    proceed = input("Do you want to proceed with the transcription? (y/n): ").strip().lower()
+    if proceed != 'y':
+        print("Aborting transcription.")
+        return
+
+    # Extract the podcast title (or default to "Podcast")
+    podcast_title = feed.feed.title if hasattr(feed.feed, "title") else "Podcast"
+    sanitized_podcast_title = sanitize_filename(podcast_title)
+
+    # Create a dedicated transcription subfolder for this podcast
+    # e.g. "transcriptions/My_Podcast_Title"
+    podcast_transcription_folder = os.path.join("transcriptions", sanitized_podcast_title)
+    os.makedirs(podcast_transcription_folder, exist_ok=True)
+
+    print(f"\nPodcast title: {podcast_title}")
+    print(f"Transcriptions will be stored in: {podcast_transcription_folder}")
+
+    # -------------- Start processing each episode --------------
+    for idx, entry in enumerate(entries_to_process, start=1):
+        # Some feeds might not have enclosures or might have multiple
+        if not entry.enclosures:
+            print(f"Episode #{idx} '{entry.title}' has no enclosures (no audio). Skipping.")
+            continue
+
+        audio_url = entry.enclosures[0].href
+        episode_title = entry.title
+        sanitized_episode_title = sanitize_filename(episode_title)
+
+        print(f"\n[Episode {idx}] {episode_title}")
+        print(f"Fetching audio from: {audio_url}")
+
+        # Create a local folder under "chunks" to store the original file and chunked parts
+        # Example: "chunks/My_Podcast_Title/Ep_Title/"
+        chunk_base_dir = os.path.join("chunks", sanitized_podcast_title)
+        os.makedirs(chunk_base_dir, exist_ok=True)
+
+        # Download the full episode audio to disk
+        episode_filename = f"{sanitized_episode_title}.mp3"
+        episode_file_path = os.path.join(chunk_base_dir, episode_filename)
+
+        try:
+            # Fetch audio file
+            with requests.get(audio_url, stream=True) as r:
+                r.raise_for_status()
+                with open(episode_file_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+            # Now we have the full episode locally; split into 5-min chunks
+            print("Splitting audio into 5-minute chunks...")
+            chunk_files = split_audio_into_chunks(episode_file_path, chunk_size_ms=5 * 60 * 1000)
+
+            # Transcribe each chunk
+            for i, chunk_path in enumerate(chunk_files, start=1):
+                print(f"Transcribing chunk {i}/{len(chunk_files)}: {os.path.basename(chunk_path)}")
+                try:
+                    text = transcribe_audio(chunk_path)
+                except Exception as e:
+                    print(f"Error transcribing chunk: {e}")
+                    continue
+
+                # Save transcript as .txt in the podcast's transcription folder
+                # e.g. "Episode_Title_part1.txt"
+                txt_filename = f"{sanitized_episode_title}_part{i}.txt"
+                transcript_path = os.path.join(podcast_transcription_folder, txt_filename)
+
+                with open(transcript_path, "w", encoding="utf-8") as txt_file:
+                    txt_file.write(text)
+
+                print(f"Saved transcript: {transcript_path}")
+
+            # Once the entire episode is done, remove the chunk folder & full episode .mp3
+            if chunk_files:
+                chunk_subfolder = os.path.dirname(chunk_files[0])
+                if os.path.exists(chunk_subfolder):
+                    print(f"Removing chunk directory: {chunk_subfolder}")
+                    shutil.rmtree(chunk_subfolder)
+
+            # Optionally remove the main .mp3 for the episode (if you don't need to keep it).
+            if os.path.exists(episode_file_path):
+                os.remove(episode_file_path)
+
+        except Exception as e:
+            print(f"Error downloading or processing episode '{episode_title}': {e}")
+            # Move on to next episode
+
+    print("\nAll requested episodes processed.")
+    print("Transcriptions completed!")
+
+if __name__ == "__main__":
+    main()
