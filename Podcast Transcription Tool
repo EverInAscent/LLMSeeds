@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 from pydub import AudioSegment
 from pydub.utils import make_chunks
 
-# Load your .env file so we have access to OPENAI_API_KEY
-load_dotenv("key2.env")
+# Create a file with your OpenAI API key and save as key.env in the project folder
+load_dotenv("key.env")
 
 ###########################################################################
 # Cost-Estimation Constants
